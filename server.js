@@ -17,9 +17,8 @@ const MIN_WITHDRAW_SATS = 50000;
 // Admin
 const ADMIN_KEY = process.env.ADMIN_KEY || "change-me";
 
-// ---- Ad sessions (MVP anti-abuse + SSV gate) ----
-// sessionId -> { deviceId, createdAt, used, ssvApproved, ssvAt, ssvMeta }
-const adSessions = new Map();
+// ---- Ad sessions (MVP anti-abuse) ----
+const adSessions = new Map(); // sessionId -> { deviceId, createdAt, used }
 const SESSION_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 function cleanupAdSessions() {
@@ -30,7 +29,7 @@ function cleanupAdSessions() {
 }
 setInterval(cleanupAdSessions, 60 * 1000);
 
-// Database
+// Database (local dev). OJO: en Render el filesystem puede ser efímero si no usas disk persistente.
 const db = new Database("satio.sqlite");
 
 db.exec(`
@@ -45,6 +44,7 @@ CREATE TABLE IF NOT EXISTS rewards (
   user_id INTEGER,
   sats INTEGER,
   day TEXT,
+  source TEXT DEFAULT 'manual',
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 `);
@@ -67,11 +67,7 @@ function getOrCreateUser(deviceId) {
   return user;
 }
 
-/**
- * =========================
- *  BALANCE
- * =========================
- */
+// ---- Balance ----
 app.post("/balance", (req, res) => {
   const { deviceId } = req.body;
   if (!deviceId) return res.status(400).json({ error: "No deviceId" });
@@ -95,12 +91,7 @@ app.post("/balance", (req, res) => {
   });
 });
 
-/**
- * =========================
- *  CREATE AD SESSION
- * =========================
- * Call this BEFORE showing rewarded ad
- */
+// ---- Create ad session (call before showing rewarded ad) ----
 app.post("/ad/session", (req, res) => {
   const { deviceId } = req.body;
   if (!deviceId) return res.status(400).json({ error: "No deviceId" });
@@ -112,10 +103,7 @@ app.post("/ad/session", (req, res) => {
   adSessions.set(sessionId, {
     deviceId,
     createdAt: Date.now(),
-    used: false,
-    ssvApproved: false,
-    ssvAt: null,
-    ssvMeta: null
+    used: false
   });
 
   res.json({
@@ -124,75 +112,9 @@ app.post("/ad/session", (req, res) => {
   });
 });
 
-/**
- * =========================
- *  ADMOB SSV CALLBACK
- * =========================
- * IMPORTANT:
- * - AdMob "Verify URL" calls GET without query params.
- *   We MUST return 200.
- *
- * We will accept:
- *  - user_id     = deviceId
- *  - custom_data = sessionId
- */
-app.get("/admob/ssv", (req, res) => {
-  const {
-    user_id,
-    custom_data,
-    reward_amount,
-    reward_item,
-    timestamp,
-    signature,
-    key_id
-  } = req.query;
-
-  // 1) Verification ping (no params)
-  if (!user_id && !custom_data) {
-    return res.status(200).send("SSV endpoint ready");
-  }
-
-  // 2) Real callback
-  try {
-    const deviceId = String(user_id || "");
-    const sessionId = String(custom_data || "");
-
-    if (!deviceId || !sessionId) {
-      return res.status(200).send("missing params");
-    }
-
-    const s = adSessions.get(sessionId);
-    if (!s) return res.status(200).send("unknown session");
-
-    // allow SSV even if reward already used? (NO)
-    if (s.used) return res.status(200).send("already used");
-
-    // must match
-    if (s.deviceId !== deviceId) return res.status(200).send("device mismatch");
-
-    s.ssvApproved = true;
-    s.ssvAt = Date.now();
-    s.ssvMeta = {
-      reward_amount,
-      reward_item,
-      timestamp,
-      signature,
-      key_id
-    };
-
-    adSessions.set(sessionId, s);
-    return res.status(200).send("ok");
-  } catch (e) {
-    // Always 200 to avoid AdMob retries spamming
-    return res.status(200).send("error");
-  }
-});
-
-/**
- * =========================
- *  REWARD (requires sessionId AND SSV approval)
- * =========================
- */
+// ---- Reward (client-based fallback) ----
+// Esto sigue existiendo por si quieres acreditar desde la app al terminar el video.
+// En producción ideal: solo SSV, pero por ahora lo dejamos.
 app.post("/reward", (req, res) => {
   const { deviceId, sessionId } = req.body;
   if (!deviceId) return res.status(400).json({ error: "No deviceId" });
@@ -202,11 +124,6 @@ app.post("/reward", (req, res) => {
   if (!s) return res.status(403).json({ error: "Invalid or expired session" });
   if (s.used) return res.status(403).json({ error: "Session already used" });
   if (s.deviceId !== deviceId) return res.status(403).json({ error: "Session/device mismatch" });
-
-  // NEW: must be approved by SSV
-  if (!s.ssvApproved) {
-    return res.status(403).json({ error: "SSV not approved yet" });
-  }
 
   // mark as used BEFORE crediting
   s.used = true;
@@ -222,17 +139,67 @@ app.post("/reward", (req, res) => {
     return res.status(429).json({ error: "Daily limit reached" });
   }
 
-  db.prepare("INSERT INTO rewards (user_id, sats, day) VALUES (?, ?, ?)")
-    .run(user.id, SATS_PER_REWARD, today());
+  db.prepare("INSERT INTO rewards (user_id, sats, day, source) VALUES (?, ?, ?, ?)")
+    .run(user.id, SATS_PER_REWARD, today(), "client");
 
   res.json({ ok: true, added: SATS_PER_REWARD });
 });
 
-/**
- * =========================
- *  STATS (protected with x-admin-key)
- * =========================
- */
+// ---- AdMob SSV (server-to-server callback) ----
+// AdMob manda parámetros como: user_id, custom_data, reward_amount, ad_unit, timestamp, signature...
+// Para MVP: validamos user_id + custom_data(sessionId) y acreditamos.
+app.get("/admob/ssv", (req, res) => {
+  const userId = req.query.user_id;       // tu deviceId
+  const sessionId = req.query.custom_data; // tu sessionId
+  const rewardAmount = req.query.reward_amount; // opcional (normalmente 1)
+
+  // AdMob recomienda siempre responder 200 OK rápido.
+  // Si falta info, respondemos 200 pero NO acreditamos, y logueamos.
+  if (!userId || !sessionId) {
+    console.log("[SSV] Missing params", { userId, sessionId });
+    return res.status(200).send("ok");
+  }
+
+  const s = adSessions.get(sessionId);
+  if (!s) {
+    console.log("[SSV] Invalid/expired session", { userId, sessionId });
+    return res.status(200).send("ok");
+  }
+
+  if (s.used) {
+    console.log("[SSV] Session already used", { userId, sessionId });
+    return res.status(200).send("ok");
+  }
+
+  if (s.deviceId !== userId) {
+    console.log("[SSV] Session/device mismatch", { userId, sessionId, expected: s.deviceId });
+    return res.status(200).send("ok");
+  }
+
+  // mark used BEFORE crediting
+  s.used = true;
+  adSessions.set(sessionId, s);
+
+  const user = getOrCreateUser(userId);
+
+  const count = db
+    .prepare("SELECT COUNT(*) as c FROM rewards WHERE user_id = ? AND day = ?")
+    .get(user.id, today()).c;
+
+  if (count >= DAILY_MAX_REWARDS) {
+    console.log("[SSV] Daily limit reached", { userId, day: today() });
+    return res.status(200).send("ok");
+  }
+
+  // MVP: ignoramos reward_amount y siempre damos SATS_PER_REWARD.
+  db.prepare("INSERT INTO rewards (user_id, sats, day, source) VALUES (?, ?, ?, ?)")
+    .run(user.id, SATS_PER_REWARD, today(), "ssv");
+
+  console.log("[SSV] Reward granted", { userId, sessionId, rewardAmount, sats: SATS_PER_REWARD });
+  return res.status(200).send("ok");
+});
+
+// ---- Stats (protected with x-admin-key) ----
 app.get("/stats", (req, res) => {
   const key = req.headers["x-admin-key"];
   if (!key || key !== ADMIN_KEY) {
@@ -262,49 +229,6 @@ app.get("/stats", (req, res) => {
     satsIssuedTotal
   });
 });
-
-// ---- AdMob SSV (real reward) ----
-app.get("/admob/ssv", (req, res) => {
-  const {
-    user_id: deviceId,
-    custom_data: sessionId,
-    reward_amount
-  } = req.query;
-
-  if (!deviceId || !sessionId) {
-    return res.status(400).send("Missing parameters");
-  }
-
-  const s = adSessions.get(sessionId);
-  if (!s || s.used || s.deviceId !== deviceId) {
-    return res.status(403).send("Invalid session");
-  }
-
-  const user = getOrCreateUser(deviceId);
-
-  const count = db
-    .prepare("SELECT COUNT(*) as c FROM rewards WHERE user_id = ? AND day = ?")
-    .get(user.id, today()).c;
-
-  if (count >= DAILY_MAX_REWARDS) {
-    return res.status(200).send("Daily limit reached");
-  }
-
-  // marcar sesión como usada
-  s.used = true;
-  adSessions.set(sessionId, s);
-
-  const sats = SATS_PER_REWARD;
-
-  db.prepare(
-    "INSERT INTO rewards (user_id, sats, day) VALUES (?, ?, ?)"
-  ).run(user.id, sats, today());
-
-  console.log(`SSV reward: ${sats} sats to ${deviceId}`);
-
-  res.status(200).send("Reward granted");
-});
-
 
 app.listen(PORT, () => {
   console.log(`SATIO backend running on http://localhost:${PORT}`);
