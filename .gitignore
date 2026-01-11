@@ -1,0 +1,4 @@
+node_modules
+satio.sqlite
+.DS_Store
+.env
