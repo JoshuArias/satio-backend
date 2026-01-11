@@ -263,17 +263,48 @@ app.get("/stats", (req, res) => {
   });
 });
 
+// ---- AdMob SSV (real reward) ----
 app.get("/admob/ssv", (req, res) => {
-  const { user_id, custom_data } = req.query;
+  const {
+    user_id: deviceId,
+    custom_data: sessionId,
+    reward_amount
+  } = req.query;
 
-  // Ping de verificación (AdMob puede llamar sin params)
-  if (!user_id && !custom_data) {
-    return res.status(200).send("SSV endpoint ready");
+  if (!deviceId || !sessionId) {
+    return res.status(400).send("Missing parameters");
   }
 
-  // Si sí viene callback real, por ahora solo responde OK (luego lo amarramos a sesiones)
-  return res.status(200).send("ok");
+  const s = adSessions.get(sessionId);
+  if (!s || s.used || s.deviceId !== deviceId) {
+    return res.status(403).send("Invalid session");
+  }
+
+  const user = getOrCreateUser(deviceId);
+
+  const count = db
+    .prepare("SELECT COUNT(*) as c FROM rewards WHERE user_id = ? AND day = ?")
+    .get(user.id, today()).c;
+
+  if (count >= DAILY_MAX_REWARDS) {
+    return res.status(200).send("Daily limit reached");
+  }
+
+  // marcar sesión como usada
+  s.used = true;
+  adSessions.set(sessionId, s);
+
+  const sats = SATS_PER_REWARD;
+
+  db.prepare(
+    "INSERT INTO rewards (user_id, sats, day) VALUES (?, ?, ?)"
+  ).run(user.id, sats, today());
+
+  console.log(`SSV reward: ${sats} sats to ${deviceId}`);
+
+  res.status(200).send("Reward granted");
 });
+
 
 app.listen(PORT, () => {
   console.log(`SATIO backend running on http://localhost:${PORT}`);
