@@ -263,6 +263,18 @@ app.get("/stats", (req, res) => {
   });
 });
 
+app.get("/admob/ssv", (req, res) => {
+  const { user_id, custom_data } = req.query;
+
+  // Ping de verificación (AdMob puede llamar sin params)
+  if (!user_id && !custom_data) {
+    return res.status(200).send("SSV endpoint ready");
+  }
+
+  // Si sí viene callback real, por ahora solo responde OK (luego lo amarramos a sesiones)
+  return res.status(200).send("ok");
+});
+
 app.listen(PORT, () => {
   console.log(`SATIO backend running on http://localhost:${PORT}`);
   console.log(`SSV verify: GET /admob/ssv`);
