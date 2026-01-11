@@ -7,7 +7,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 
 // Rules
 const SATS_PER_REWARD = 100;
@@ -17,8 +17,9 @@ const MIN_WITHDRAW_SATS = 50000;
 // Admin
 const ADMIN_KEY = process.env.ADMIN_KEY || "change-me";
 
-// ---- Ad sessions (MVP anti-abuse) ----
-const adSessions = new Map(); // sessionId -> { deviceId, createdAt, used }
+// ---- Ad sessions (MVP anti-abuse + SSV gate) ----
+// sessionId -> { deviceId, createdAt, used, ssvApproved, ssvAt, ssvMeta }
+const adSessions = new Map();
 const SESSION_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 function cleanupAdSessions() {
@@ -66,7 +67,11 @@ function getOrCreateUser(deviceId) {
   return user;
 }
 
-// ---- Balance ----
+/**
+ * =========================
+ *  BALANCE
+ * =========================
+ */
 app.post("/balance", (req, res) => {
   const { deviceId } = req.body;
   if (!deviceId) return res.status(400).json({ error: "No deviceId" });
@@ -90,7 +95,12 @@ app.post("/balance", (req, res) => {
   });
 });
 
-// ---- Create ad session (call before showing rewarded ad) ----
+/**
+ * =========================
+ *  CREATE AD SESSION
+ * =========================
+ * Call this BEFORE showing rewarded ad
+ */
 app.post("/ad/session", (req, res) => {
   const { deviceId } = req.body;
   if (!deviceId) return res.status(400).json({ error: "No deviceId" });
@@ -102,7 +112,10 @@ app.post("/ad/session", (req, res) => {
   adSessions.set(sessionId, {
     deviceId,
     createdAt: Date.now(),
-    used: false
+    used: false,
+    ssvApproved: false,
+    ssvAt: null,
+    ssvMeta: null
   });
 
   res.json({
@@ -111,7 +124,75 @@ app.post("/ad/session", (req, res) => {
   });
 });
 
-// ---- Reward (requires sessionId) ----
+/**
+ * =========================
+ *  ADMOB SSV CALLBACK
+ * =========================
+ * IMPORTANT:
+ * - AdMob "Verify URL" calls GET without query params.
+ *   We MUST return 200.
+ *
+ * We will accept:
+ *  - user_id     = deviceId
+ *  - custom_data = sessionId
+ */
+app.get("/admob/ssv", (req, res) => {
+  const {
+    user_id,
+    custom_data,
+    reward_amount,
+    reward_item,
+    timestamp,
+    signature,
+    key_id
+  } = req.query;
+
+  // 1) Verification ping (no params)
+  if (!user_id && !custom_data) {
+    return res.status(200).send("SSV endpoint ready");
+  }
+
+  // 2) Real callback
+  try {
+    const deviceId = String(user_id || "");
+    const sessionId = String(custom_data || "");
+
+    if (!deviceId || !sessionId) {
+      return res.status(200).send("missing params");
+    }
+
+    const s = adSessions.get(sessionId);
+    if (!s) return res.status(200).send("unknown session");
+
+    // allow SSV even if reward already used? (NO)
+    if (s.used) return res.status(200).send("already used");
+
+    // must match
+    if (s.deviceId !== deviceId) return res.status(200).send("device mismatch");
+
+    s.ssvApproved = true;
+    s.ssvAt = Date.now();
+    s.ssvMeta = {
+      reward_amount,
+      reward_item,
+      timestamp,
+      signature,
+      key_id
+    };
+
+    adSessions.set(sessionId, s);
+    return res.status(200).send("ok");
+  } catch (e) {
+    // Always 200 to avoid AdMob retries spamming
+    return res.status(200).send("error");
+  }
+});
+
+/**
+ * =========================
+ *  REWARD (requires sessionId AND SSV approval)
+ * =========================
+ */
 app.post("/reward", (req, res) => {
   const { deviceId, sessionId } = req.body;
   if (!deviceId) return res.status(400).json({ error: "No deviceId" });
@@ -121,6 +202,11 @@ app.post("/reward", (req, res) => {
   if (!s) return res.status(403).json({ error: "Invalid or expired session" });
   if (s.used) return res.status(403).json({ error: "Session already used" });
   if (s.deviceId !== deviceId) return res.status(403).json({ error: "Session/device mismatch" });
+
+  // NEW: must be approved by SSV
+  if (!s.ssvApproved) {
+    return res.status(403).json({ error: "SSV not approved yet" });
+  }
 
   // mark as used BEFORE crediting
   s.used = true;
@@ -142,7 +228,11 @@ app.post("/reward", (req, res) => {
   res.json({ ok: true, added: SATS_PER_REWARD });
 });
 
-// ---- Stats (protected with x-admin-key) ----
+/**
+ * =========================
+ *  STATS (protected with x-admin-key)
+ * =========================
+ */
 app.get("/stats", (req, res) => {
   const key = req.headers["x-admin-key"];
   if (!key || key !== ADMIN_KEY) {
@@ -175,4 +265,5 @@ app.get("/stats", (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`SATIO backend running on http://localhost:${PORT}`);
+  console.log(`SSV verify: GET /admob/ssv`);
 });
